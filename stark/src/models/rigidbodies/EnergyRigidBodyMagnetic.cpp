@@ -89,150 +89,6 @@ stark::EnergyRigidBodyMagnetic::EnergyRigidBodyMagnetic(core::Stark& stark, spRi
 			}
 		);
 	}
-	else if (method == MagneticMethod::DipoleMoment_DoF)
-	{
-		stark.global_energy.add_energy("EnergyRigidBodyMagnetic_linear_dipole", this->conn_fully_implicit,
-		    [&](symx::Energy &energy, symx::Element &conn)
-			{
-				const std::vector<symx::Index> &bodyIDs = conn.slice(0, 2);
-				const std::vector<symx::Index> &magneticIDs = conn.slice(2, 4);
-				const std::vector<symx::Index> &magneticMaterials = conn.slice(4, 6);
-				const std::vector<symx::Index> &sampleIDs = conn.slice(6, 8);
-
-				std::vector<symx::Vector> v1 = energy.make_dof_vectors(this->rb->dof_v,
-																	   this->rb->v1,
-																	   bodyIDs);
-				std::vector<symx::Vector> w1 = energy.make_dof_vectors(this->rb->dof_w,
-																	   this->rb->w1,
-																	   bodyIDs);
-
-
-				std::vector<symx::Vector> t0 = energy.make_vectors(this->rb->t0, bodyIDs);
-				std::vector<symx::Vector> w0 = energy.make_vectors(this->rb->w0, bodyIDs);
-				std::vector<symx::Vector> q0 = energy.make_vectors(this->rb->q0_, bodyIDs);
-
-				symx::Scalar dt = energy.make_scalar(stark.dt);
-				std::vector<symx::Vector> magn_samp_offset_loc = energy.make_vectors(
-					this->magnetic_sample_pos_local, sampleIDs);
-
-				std::vector<symx::Vector> t1 = {
-					time_integration(t0[0], v1[0], dt),
-					time_integration(t0[1], v1[1], dt)
-				};
-				std::vector<symx::Matrix> R0 = {
-					quat_to_rotation(q0[0]),
-					quat_to_rotation(q0[1])
-				};
-				std::vector<symx::Matrix> R1 = {
-					quat_time_integration_as_rotation_matrix(q0[0], w1[0], dt),
-					quat_time_integration_as_rotation_matrix(q0[1], w1[1], dt)
-				};
-
-				std::vector<symx::Vector> m1_glob;
-				for (int i = 0; i < 2; i++)
-				{
-					if (static_cast<MagneticMaterial>(magneticMaterials[i].idx) == MagneticMaterial::Permanent)
-					{
-						m1_glob.push_back(energy.make_vector(this->magnetic_dipole_moment_local, magneticIDs[i]));
-					}
-					else if (static_cast<MagneticMaterial>(magneticMaterials[i].idx) == MagneticMaterial::Linear)
-					{
-						m1_glob.push_back(energy.make_dof_vector(this->dof_m, this->magnetic_dipole_moment_local, magneticIDs[i]));
-					}
-				}
-
-				std::vector<symx::Vector> global_offset_from_cog = {
-					local_to_global_direction(magn_samp_offset_loc[0], R1[0]),
-					local_to_global_direction(magn_samp_offset_loc[1], R1[1])
-				};
-
-				std::vector<symx::Vector> pos = {
-					t1[0] + global_offset_from_cog[0],
-					t1[1] + global_offset_from_cog[1]
-				};
-
-				symx::Vector dist_vec = pos[1] - pos[0];
-				symx::Scalar dist = dist_vec.norm();
-				symx::Vector norm_dist = dist_vec / dist;
-
-				symx::Vector B_ext = MU_0 * (3.0 * norm_dist * norm_dist.dot(m1_glob[1]) - m1_glob[1]) /
-									 (4.0 * M_PI * dist * dist * dist);
-
-				symx::Scalar E = -m1_glob[0].dot(B_ext);
-				energy.set(E);
-			}
-		);
-	}
-	else if (method == MagneticMethod::Jackson_old)
-	{
-		stark.global_energy.add_energy("EnergyRigidBodyMagnetic_linear_Jackson", this->conn_implicit,
-            [&](symx::Energy &energy, symx::Element &conn)
-			{
-				const std::vector<symx::Index> &bodyIDs = conn.slice(0, 2);
-				const std::vector<symx::Index> &magneticIDs = conn.slice(2, 4);
-				const std::vector<symx::Index> &sampleIDs = conn.slice(4, 6);
-
-				std::vector<symx::Vector> v1 = energy.make_dof_vectors(this->rb->dof_v,
-																	   this->rb->v1,
-																	   bodyIDs);
-				std::vector<symx::Vector> w1 = energy.make_dof_vectors(this->rb->dof_w,
-																	   this->rb->w1,
-																	   bodyIDs);
-				std::vector<symx::Vector> t0 = energy.make_vectors(this->rb->t0, bodyIDs);
-				std::vector<symx::Vector> w0 = energy.make_vectors(this->rb->w0, bodyIDs);
-				std::vector<symx::Vector> q0 = energy.make_vectors(this->rb->q0_, bodyIDs);
-
-				symx::Scalar dt = energy.make_scalar(stark.dt);
-				std::vector<symx::Vector> magn_samp_offset_loc = energy.make_vectors(
-					this->magnetic_sample_pos_local, sampleIDs);
-
-				std::vector<symx::Vector> t1 = {
-					time_integration(t0[0], v1[0], dt),
-					time_integration(t0[1], v1[1], dt)
-				};
-				std::vector<symx::Matrix> R0 = {
-					quat_to_rotation(q0[0]),
-					quat_to_rotation(q0[1])
-				};
-				std::vector<symx::Matrix> R1 = {
-					quat_time_integration_as_rotation_matrix(q0[0], w1[0], dt),
-					quat_time_integration_as_rotation_matrix(q0[1], w1[1], dt)
-				};
-
-				std::vector<symx::Vector> magn_dip_mom_glob = energy.make_vectors(this->magnetic_dipole_moment_local, sampleIDs);
-
-				std::vector<symx::Vector> global_offset_from_cog = {
-					local_to_global_direction(magn_samp_offset_loc[0], R1[0]),
-					local_to_global_direction(magn_samp_offset_loc[1], R1[1])
-				};
-
-				std::vector<symx::Vector> pos = {
-					t1[0] + global_offset_from_cog[0],
-					t1[1] + global_offset_from_cog[1]
-				};
-
-				symx::Vector dist_vec = pos[1] - pos[0];
-				symx::Scalar dist = dist_vec.norm();
-				symx::Vector norm_dist = dist_vec / dist;
-				std::vector<symx::Scalar> volume = {
-					energy.make_scalar(this->magnetic_sample_volume, magneticIDs[0]),
-					energy.make_scalar(this->magnetic_sample_volume, magneticIDs[1])
-				};
-
-				symx::Vector H_ext = (3.0 * norm_dist * norm_dist.dot(magn_dip_mom_glob[1]) -
-									  magn_dip_mom_glob[1]) /
-									 (4.0 * M_PI * dist * dist * dist);
-				symx::Vector H_int = -magn_dip_mom_glob[0] / (3.0 * volume[0]);
-				symx::Vector H = H_ext + H_int;
-
-				symx::Scalar magn_permeab_0 = energy.make_scalar(this->magnetic_permeability,
-																 magneticIDs[0]);
-
-				symx::Scalar E = 0.5 * (magn_permeab_0 - MU_0) * volume[0] * H.dot(H_ext);
-				energy.set(E);
-			}
-		);
-	}
 }
 
 stark::EnergyRigidBodyMagnetic::Handler stark::EnergyRigidBodyMagnetic::add(const RigidBodyHandler& rb, const Params& params)
@@ -325,6 +181,7 @@ void stark::EnergyRigidBodyMagnetic::add_magnetic_samples(const stark::EnergyRig
 	this->average_sample_radius += (radius - this->average_sample_radius) / magnetic_sample_range.size();
 }
 
+
 void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 {
 	stark.logger.start_timing("magnetic_before_time_step");
@@ -338,6 +195,9 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 	std::vector<Eigen::Vector3d> new_magnetic_dipole_moments_local(this->magnetic_dipole_moment_local.size(), Eigen::Vector3d::Zero());
 
 	// Determine dipole moment of linear magnets
+	// This is only for *magnetizable* rigid bodies e.g. objects without intrinsic magnetization
+	// since PMs are initialized with dipole/magnetization already
+	// Not relevant to my planned demos
 	#pragma omp parallel for schedule(static) default(shared)
 	for (int mrb_a = 0; mrb_a < n; mrb_a++)
 	{
@@ -397,6 +257,7 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 
 	std::vector<std::vector<std::array<int32_t, 6>>> conn_implicit_per_body(n);
 
+	// Find magnetic dipole pairs, determine coupling, and decide which solver to use
 	#pragma omp parallel for schedule(static) default(shared)
 	for (int mrb_a = 0; mrb_a < n; mrb_a++)
 	{
@@ -436,6 +297,7 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 
 					if (r_ij.norm() < distance_threshold)
 					{
+						// The magnets are stongly coupled! Need implicit Newton solver and line-search 
 						this->is_strongly_coupled[sampleID_i][sampleID_j] = true;
 						conn_implicit_per_body[mrb_a].push_back({rb_a, rb_b, mrb_a, mrb_b, sampleID_i, sampleID_j});
 						#pragma omp critical
@@ -485,7 +347,7 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 		for (const auto& rb_conn : rb_conns)
 			conn_implicit.push_back(rb_conn);
 
-	std::cout << "Implicit pairs: " << conn_implicit.size() << std::endl;
+	// std::cout << "Implicit pairs: " << conn_implicit.size() << std::endl;
 
 	stark.logger.stop_timing_add("magnetic_before_time_step");
 }
