@@ -16,6 +16,7 @@ stark::EnergyRigidBodyMagnetic::EnergyRigidBodyMagnetic(core::Stark& stark, spRi
 {
 	const MagneticMethod method = stark.settings.simulation.magnetic_method;
 
+	// to enable magnetic energy insertion in between time steps
 	stark.callbacks.add_before_time_step([&]() { this->_before_time_step(stark); });
 	stark.callbacks.add_is_converged_state_valid([&]() { return this->_is_converged_state_valid(stark); });
 	stark.callbacks.add_after_time_step([&]() { return this->_after_time_step(stark); });
@@ -27,63 +28,94 @@ stark::EnergyRigidBodyMagnetic::EnergyRigidBodyMagnetic(core::Stark& stark, spRi
 	average_sample_radius = 0.0;
 	distance_threshold = std::numeric_limits<double>::max();
 
+	// This is the default magnetic method described in my write-up, we don't use the other two
+	// This runs for each pair of interacting dipoles
 	if (method == MagneticMethod::DipoleMoment)
 	{
 		stark.global_energy.add_energy("EnergyRigidBodyMagnetic_linear_dipole", this->conn_implicit,
 			[&](symx::Energy &energy, symx::Element &conn)
 			{
+				// Rigid bodies (RBs)
 				const std::vector<symx::Index> &bodyIDs = conn.slice(0, 2);
+				// Magnetic rigid bodies (MRBs)
 				const std::vector<symx::Index> &magneticIDs = conn.slice(2, 4);
+				// Magnetic dipoles (discretized elements within MRBs)
 				const std::vector<symx::Index> &sampleIDs = conn.slice(4, 6);
 
+				// Formulates energy problem in terms of linear and angular velocities
+				
+				// Linear velocity at next timestep
 				std::vector<symx::Vector> v1 = energy.make_dof_vectors(this->rb->dof_v,
 																	   this->rb->v1,
 																	   bodyIDs);
+				// Angular velocity at next timestep
 				std::vector<symx::Vector> w1 = energy.make_dof_vectors(this->rb->dof_w,
 																	   this->rb->w1,
 																	   bodyIDs);
+				// Previous time step position, angular velocity, and orientation
+				// As far as I can tell, we don't use w0 since the position and orientation
+				// are only updated using energy w1 at time step t+dt 
 				std::vector<symx::Vector> t0 = energy.make_vectors(this->rb->t0, bodyIDs);
 				std::vector<symx::Vector> w0 = energy.make_vectors(this->rb->w0, bodyIDs);
 				std::vector<symx::Vector> q0 = energy.make_vectors(this->rb->q0_, bodyIDs);
-
+				
+				// Timestep dt
 				symx::Scalar dt = energy.make_scalar(stark.dt);
+
+				// Local positions of all dipoles, relative to their RB
 				std::vector<symx::Vector> magn_samp_offset_loc = energy.make_vectors(
 					this->magnetic_sample_pos_local, sampleIDs);
 
+				// Integrate RB global position over linear velocity for timestep
 				std::vector<symx::Vector> t1 = {
 					time_integration(t0[0], v1[0], dt),
 					time_integration(t0[1], v1[1], dt)
 				};
+
+				// Get initial global orientation
 				std::vector<symx::Matrix> R0 = {
 					quat_to_rotation(q0[0]),
 					quat_to_rotation(q0[1])
 				};
+
+				// Integrate RB global orientation over angular velocity for timestep
 				std::vector<symx::Matrix> R1 = {
 					quat_time_integration_as_rotation_matrix(q0[0], w1[0], dt),
 					quat_time_integration_as_rotation_matrix(q0[1], w1[1], dt)
 				};
+
+				// Get the dipole sample moments (magnetization vectors) in local RB coords 
 				std::vector<symx::Vector> m0 = energy.make_vectors(magnetic_dipole_moment_local, sampleIDs);
+				// Convert to global dipole magnetization orientations using updated rotation
 				std::vector<symx::Vector> m1 = {
 					local_to_global_direction(m0[0], R1[0]),
 					local_to_global_direction(m0[1], R1[1]),
 				};
-
+				// Apply dipole offset within RB from its global position
 				std::vector<symx::Vector> global_offset_from_cog = {
 					local_to_global_direction(magn_samp_offset_loc[0], R1[0]),
 					local_to_global_direction(magn_samp_offset_loc[1], R1[1])
 				};
-
 				std::vector<symx::Vector> pos = {
 					t1[0] + global_offset_from_cog[0],
 					t1[1] + global_offset_from_cog[1]
 				};
-
+				
+				// Get the distance and relative position between the dipoles
 				symx::Vector dist_vec = pos[1] - pos[0];
 				symx::Scalar dist = dist_vec.norm();
 				symx::Vector norm_dist = dist_vec / dist;
 
-				symx::Vector B_ext = (3.0 * norm_dist * norm_dist.dot(m1[1]) - m1[1]) * MU_0 / (4.0 * M_PI * dist * dist * dist);
-
+				// Calculate the field produced by dipole 1 at location of dipole 0
+				// B_field = (u0 / 4*pi*||r||^3)*(3*r_hat*(r_hat dot m) - m)
+				// r = distance from source dist_vec
+				// r_hat = norm_dist
+				// m = dipole moment m1[1]
+				// u0 = permittivity of free space const MU_0
+				symx::Vector B_ext = (MU_0 / (4*M_PI*dist*dist*dist)) * (3*norm_dist*(norm_dist.dot(m1[1])) - m1[1]);
+				
+				// Calculate magnetic potential energy of dipole 0 in the field of dipole 1
+				// E = -(1/2)(Magnetization)(Field strength)
 				symx::Scalar E = -0.5 * m1[0].dot(B_ext);
 				energy.set(E);
 			}
@@ -259,6 +291,7 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 
 	// Find magnetic dipole pairs, determine coupling, and decide which solver to use
 	#pragma omp parallel for schedule(static) default(shared)
+	// Loop over all pairs of magnetic rigid bodies (MRBs)
 	for (int mrb_a = 0; mrb_a < n; mrb_a++)
 	{
 		if (!this->enabled[mrb_a])
@@ -274,7 +307,8 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 
 			if (!this->enabled[mrb_b] || rb_a == rb_b)
 				continue;
-
+			
+			// Loop over all pairs of dipole samples within/between the two MRBs
 			for (int sampleID_i = magn_sample_range_i[0]; sampleID_i < magn_sample_range_i[1]; sampleID_i++)
 			{
 				this->is_strongly_coupled[sampleID_i] = std::vector<bool>(this->magnetic_dipole_moment_local.size(), false);
@@ -284,9 +318,9 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 				if (this->magnetic_material[mrb_a] == MagneticMaterial::Linear)
 					this->magnetic_dipole_moment_local[sampleID_i] = new_magnetic_dipole_moments_local[sampleID_i];
 
-				// Find magnetic pairs
 				for (int sampleID_j = magn_sample_range_j[0]; sampleID_j < magn_sample_range_j[1]; sampleID_j++)
 				{
+					// Compute distance between dipoles
 					const Eigen::Vector3d sample_pos_global_i =
 						local_to_global_direction(this->magnetic_sample_pos_local[sampleID_i], this->rb->R0[rb_a]) +
 						this->rb->t0[rb_a];
@@ -295,9 +329,11 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 						this->rb->t0[rb_b];
 					const Eigen::Vector3d r_ij = sample_pos_global_i - sample_pos_global_j;
 
+					// If magnets are close enough, ...
 					if (r_ij.norm() < distance_threshold)
 					{
-						// The magnets are stongly coupled! Need implicit Newton solver and line-search 
+						// The magnets are stongly coupled! Store the pair to compute energy and gradients,
+						// to be passed to Newton solver along with other energies 
 						this->is_strongly_coupled[sampleID_i][sampleID_j] = true;
 						conn_implicit_per_body[mrb_a].push_back({rb_a, rb_b, mrb_a, mrb_b, sampleID_i, sampleID_j});
 						#pragma omp critical
@@ -305,36 +341,34 @@ void stark::EnergyRigidBodyMagnetic::_before_time_step(core::Stark& stark)
 							magnetic_hessian_pairs.insert({rb_a, rb_b});
 						};
 					}
-					else
+					else // magnets are far enough away, ...
 					{
-						// Note: Updating to R1 and t1 does not yield any improvements!
-
-						// Magnetic values in world coordinates
+						// Magnetic dipole moments in global coordinates
 						const Eigen::Vector3d mag_dip_mom_i = local_to_global_direction(this->magnetic_dipole_moment_local[sampleID_i], this->rb->R0[rb_a]);
 						const Eigen::Vector3d mag_dip_mom_j = local_to_global_direction(this->magnetic_dipole_moment_local[sampleID_j], this->rb->R0[rb_b]);
 						const Eigen::Vector3d r_ij_hat = r_ij.normalized();
 
-						// Magnetic force
+						// Calculate magnetic force of one acting on the other
 						const Eigen::Vector3d force_ij = MU_0 / (8.0 * M_PI * pow(r_ij.norm(), 4.0)) *
 														 (-15.0 * r_ij_hat * (mag_dip_mom_i.dot(r_ij_hat)) *
 														  (mag_dip_mom_j.dot(r_ij_hat))
 														  + 3.0 * r_ij_hat * (mag_dip_mom_j.dot(mag_dip_mom_i))
 														  + 3.0 * mag_dip_mom_i * (mag_dip_mom_j.dot(r_ij_hat))
 														  + 3.0 * mag_dip_mom_j * (mag_dip_mom_i.dot(r_ij_hat)));
-
+						// Calculate magnetic torque of one acting on the other
 						const Eigen::Vector3d torque_ij = MU_0 / (8.0 * M_PI * pow(r_ij.norm(), 3.0)) *
 														  (3.0 * r_ij_hat.dot(mag_dip_mom_j) *
 														   mag_dip_mom_i.cross(r_ij_hat)
 														   - mag_dip_mom_i.cross(mag_dip_mom_j));
 
-						// Magnetic and mechanical torque
-						this->rb->force[rb_a] += force_ij;
-						this->rb->torque[rb_a] += (sample_pos_global_i - this->rb->t0[rb_a]).cross(force_ij);
+						// Apply the force and torque to one dipole
+						// (the other dipole will have this recomputed and applied in its iteration of 
+						// the loop - not super efficient)
+						this->rb->force[rb_a] += force_ij; // magnetic force
+						this->rb->torque[rb_a] += (sample_pos_global_i - this->rb->t0[rb_a]).cross(force_ij); // force-induced torque
+						this->rb->torque[rb_a] += torque_ij; // magnetic torque
 
-						// Magnetic torque
-						this->rb->torque[rb_a] += torque_ij;
-
-						// Debug fields
+						// Debug fields: can be used to check that pairs have equal and opposite effects 
 						this->force_ij[sampleID_i][sampleID_j] = force_ij;
 						this->torque_ij[sampleID_i][sampleID_j] = (sample_pos_global_i - this->rb->t0[rb_a]).cross(force_ij) + torque_ij;
 					}
